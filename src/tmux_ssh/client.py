@@ -33,7 +33,7 @@ class Config:
     start_marker: str = "___CMD_START_MARKER___"
     end_marker: str = "___CMD_COMPLETE_MARKER___"
     ssh_key_path: str = os.path.expanduser("~/.ssh/id_ed25519")
-    log_dir: str = "~/tmux_ssh_logs"  # Remote server log directory
+    log_dir: str = "$HOME/tmux_ssh_logs"  # Remote server log directory
 
 
 class TmuxSSHClient:
@@ -542,12 +542,10 @@ class TmuxSSHClient:
             # Determine session name
             if new_session:
                 session_name = f"task_{uuid.uuid4().hex[:8]}"
-                print(f"[*] Creating new session: {session_name}")
             else:
                 session_name = self._find_existing_session(client)
                 if not session_name:
                     session_name = self.config.default_session
-                print(f"[*] Using existing session: {session_name}")
 
                 if not force and self._check_command_running(client, session_name):
                     print(f"\n[!] Command already running in session '{session_name}'.")
@@ -634,7 +632,11 @@ class TmuxSSHClient:
 
             stdin, stdout, stderr = client.exec_command(dispatch_cmd)
             target_session = stdout.read().decode().strip()
-            print(f"[*] Running in tmux session: {target_session}")
+
+            if new_session:
+                print(f"[*] Created new session: {target_session}")
+            else:
+                print(f"[*] Using session: {target_session}")
 
             if timeout:
                 print(f"[*] Timeout: {timeout}s, Idle timeout: {idle_timeout}s")
