@@ -1,6 +1,6 @@
 # tmux-ssh
 
-Execute remote commands via SSH in tmux sessions with real-time output streaming.
+Execute remote commands via SSH in tmux sessions with real-time output streaming and batch mode.
 
 ## Features
 
