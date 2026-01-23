@@ -17,8 +17,8 @@ from tmux_ssh.client import (
 CONFIG_FILE = os.path.expanduser("~/.tmux_ssh_config")
 
 
-def load_saved_config() -> dict[str, str]:
-    """Load saved host/user from config file."""
+def load_saved_config() -> dict[str, str | bool]:
+    """Load saved host/user/settings from config file."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE) as f:
@@ -28,9 +28,18 @@ def load_saved_config() -> dict[str, str]:
     return {}
 
 
-def save_config(host: str, user: str, last_server: str | None = None) -> None:
-    """Save host/user/last_server to config file for future use."""
-    config: dict[str, str] = {"host": host, "user": user}
+def save_config(
+    host: str,
+    user: str,
+    last_server: str | None = None,
+    auto_new_session: bool = True,
+) -> None:
+    """Save host/user/last_server/settings to config file for future use."""
+    config: dict[str, str | bool] = {
+        "host": host,
+        "user": user,
+        "auto_new_session": auto_new_session,
+    }
     if last_server:
         config["last_server"] = last_server
     try:
@@ -98,6 +107,19 @@ def main(args: list[str] | None = None) -> int:
         action="store_true",
         help="Clean up idle task_* sessions (keeps remote_task)",
     )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        dest="auto",
+        default=None,
+        help="Auto-create new session if command already running (default: true)",
+    )
+    parser.add_argument(
+        "--no-auto",
+        action="store_false",
+        dest="auto",
+        help="Disable auto-create, block if command already running",
+    )
     parser.add_argument("command", nargs="*", help="The command to execute remotely")
 
     parsed_args = parser.parse_args(args)
@@ -118,8 +140,14 @@ def main(args: list[str] | None = None) -> int:
             print("[!] Username is required.")
             return 1
 
+    # Resolve auto: CLI arg > saved config > default (True)
+    if parsed_args.auto is not None:
+        auto = parsed_args.auto
+    else:
+        auto = saved.get("auto_new_session", True)
+
     # Save for future use (without last_server yet, will update after connection)
-    save_config(host, user, saved.get("last_server"))
+    save_config(host, user, saved.get("last_server"), auto)
 
     config = Config(hostname=host, username=user)
     last_server = saved.get("last_server")
@@ -133,13 +161,13 @@ def main(args: list[str] | None = None) -> int:
         result = client.list_running()
         # Save current server for next time
         if client.current_server:
-            save_config(host, user, client.current_server)
+            save_config(host, user, client.current_server, auto)
         return result
 
     if parsed_args.cleanup:
         result = client.cleanup()
         if client.current_server:
-            save_config(host, user, client.current_server)
+            save_config(host, user, client.current_server, auto)
         return result
 
     if parsed_args.attach is not None:
@@ -147,7 +175,7 @@ def main(args: list[str] | None = None) -> int:
         session = parsed_args.attach if parsed_args.attach else None
         result = client.attach(session)
         if client.current_server:
-            save_config(host, user, client.current_server)
+            save_config(host, user, client.current_server, auto)
         return result
 
     user_cmd = " ".join(parsed_args.command)
@@ -160,9 +188,10 @@ def main(args: list[str] | None = None) -> int:
         idle_timeout=parsed_args.idle_timeout,
         new_session=parsed_args.new,
         force=parsed_args.force,
+        auto=auto,
     )
     if client.current_server:
-        save_config(host, user, client.current_server)
+        save_config(host, user, client.current_server, auto)
     return result
 
 

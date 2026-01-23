@@ -80,3 +80,6 @@ Thumbs.db
 
 # Prototype backup files
 prototype/tmux_ssh_cp.py
+
+# Local utility scripts
+switch_git_remote.py

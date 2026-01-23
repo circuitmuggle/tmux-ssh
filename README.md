@@ -7,6 +7,7 @@ Execute remote commands via SSH in tmux sessions with real-time output streaming
 - **Real-time output streaming** - See command output as it happens
 - **Tmux-based execution** - Commands run in persistent tmux sessions
 - **Concurrent execution** - Run multiple commands in parallel with `--new`
+- **Auto-new session** - Automatically creates new session if command already running (default: on)
 - **Directory inheritance** - `--new` sessions inherit current directory from default session
 - **Auto-cleanup** - `--new` sessions automatically terminate when commands complete
 - **Running command detection** - Prevents accidental command conflicts
@@ -226,6 +227,8 @@ log: ~/tmux_ssh_logs/remote_task_20260120_100000.log
 | `-a, --attach [SESSION]` | Attach to session (auto-detect if not specified) |
 | `-l, --list` | List all running commands/sessions |
 | `--cleanup` | Clean up idle task_* sessions (keeps remote_task) |
+| `--auto` | Auto-create new session if command already running (default: true) |
+| `--no-auto` | Disable auto-create, block if command already running |
 | `-C, --clear` | Clear stored credentials |
 
 ## Exit Codes

@@ -520,6 +520,7 @@ class TmuxSSHClient:
         idle_timeout: int = 3600,
         new_session: bool = False,
         force: bool = False,
+        auto: bool = True,
     ) -> int:
         """Execute a command in tmux and stream output in real-time.
 
@@ -529,6 +530,7 @@ class TmuxSSHClient:
             idle_timeout: Exit if no output for N seconds (default: 3600)
             new_session: Create a new unique session
             force: Force execution even if command is running
+            auto: Auto-create new session if command already running (default: True)
 
         Returns:
             Exit code (EXIT_COMPLETED, EXIT_ERROR, EXIT_STILL_RUNNING, EXIT_BLOCKED)
@@ -552,12 +554,24 @@ class TmuxSSHClient:
                     session_name = self.config.default_session
 
                 if not force and self._check_command_running(client, session_name):
-                    print(f"\n[!] Command already running in session '{session_name}'.")
-                    print("[*] Options:")
-                    print("    --new   : Run in a new session (safe concurrency)")
-                    print("    --force : Override and kill existing command")
-                    client.close()
-                    return EXIT_BLOCKED
+                    if auto:
+                        # Auto-create new session
+                        print(
+                            f"[*] Command already running in '{session_name}', "
+                            "auto-creating new session..."
+                        )
+                        new_session = True
+                        session_name = f"task_{uuid.uuid4().hex[:8]}"
+                    else:
+                        print(
+                            f"\n[!] Command already running in session '{session_name}'."
+                        )
+                        print("[*] Options:")
+                        print("    --new   : Run in a new session (safe concurrency)")
+                        print("    --force : Override and kill existing command")
+                        print("    --auto  : Enable auto-create new session (default)")
+                        client.close()
+                        return EXIT_BLOCKED
 
             log_file = self.get_log_file(session_name, self.config.log_dir)
             log_symlink = self.get_log_symlink(session_name, self.config.log_dir)
@@ -635,12 +649,14 @@ class TmuxSSHClient:
                 )
 
             stdin, stdout, stderr = client.exec_command(dispatch_cmd)
-            target_session = stdout.read().decode().strip()
+            # Read stdout to ensure command completes, but use session_name
+            # which we already know (more reliable than parsing command output)
+            stdout.read()
 
             if new_session:
-                print(f"[*] Created new session: {target_session}")
+                print(f"[*] Created new session: {session_name}")
             else:
-                print(f"[*] Using session: {target_session}")
+                print(f"[*] Using session: {session_name}")
 
             if timeout:
                 print(f"[*] Timeout: {timeout}s, Idle timeout: {idle_timeout}s")

@@ -52,27 +52,31 @@ class TestTmuxSSHClient:
 
     def test_get_log_file(self) -> None:
         """Test log file path generation."""
+        log_dir = "/tmp/logs"
+        timestamp = "20240101_120000"
         assert (
-            TmuxSSHClient.get_log_file("my_session") == "/tmp/cmd_output_my_session.log"
+            TmuxSSHClient.get_log_file("my_session", log_dir, timestamp)
+            == "/tmp/logs/my_session_20240101_120000.log"
         )
         assert (
-            TmuxSSHClient.get_log_file("session/with/slash")
-            == "/tmp/cmd_output_session_with_slash.log"
+            TmuxSSHClient.get_log_file("session/with/slash", log_dir, timestamp)
+            == "/tmp/logs/session_with_slash_20240101_120000.log"
         )
         assert (
-            TmuxSSHClient.get_log_file("session with space")
-            == "/tmp/cmd_output_session_with_space.log"
+            TmuxSSHClient.get_log_file("session with space", log_dir, timestamp)
+            == "/tmp/logs/session_with_space_20240101_120000.log"
         )
 
     def test_get_lock_file(self) -> None:
         """Test lock file path generation."""
+        log_dir = "/tmp/logs"
         assert (
-            TmuxSSHClient.get_lock_file("my_session")
-            == "/tmp/cmd_running_my_session.lock"
+            TmuxSSHClient.get_lock_file("my_session", log_dir)
+            == "/tmp/logs/my_session.lock"
         )
         assert (
-            TmuxSSHClient.get_lock_file("session/test")
-            == "/tmp/cmd_running_session_test.lock"
+            TmuxSSHClient.get_lock_file("session/test", log_dir)
+            == "/tmp/logs/session_test.lock"
         )
 
     def test_client_initialization(self, mock_config: Config) -> None:
@@ -199,7 +203,7 @@ class TestCommandExecution:
                             mock_config,
                             password_provider=lambda h, u: "password",
                         )
-                        result = client.execute("hostname", force=False)
+                        result = client.execute("hostname", force=False, auto=False)
 
         assert result == EXIT_BLOCKED
         captured = capsys.readouterr()

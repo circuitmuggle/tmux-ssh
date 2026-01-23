@@ -37,9 +37,9 @@ def load_saved_config():
     return {}
 
 
-def save_config(host, user, last_server=None):
-    """Save host/user/last_server to config file for future use."""
-    config = {"host": host, "user": user}
+def save_config(host, user, last_server=None, auto_new_session=True):
+    """Save host/user/last_server/settings to config file for future use."""
+    config = {"host": host, "user": user, "auto_new_session": auto_new_session}
     if last_server:
         config["last_server"] = last_server
     try:
@@ -486,6 +486,7 @@ def execute_remote_cmd(
     new_session=False,
     force=False,
     last_server=None,
+    auto=True,
 ):
     """
     Execute a command in tmux and stream output in real-time.
@@ -499,6 +500,7 @@ def execute_remote_cmd(
         new_session: Create a new unique session
         force: Force execution even if command is running
         last_server: Previously connected server (for change detection)
+        auto: Auto-create new session if command already running (default: True)
 
     Returns:
         (EXIT_COMPLETED (0): Command finished, current_server)
@@ -523,12 +525,22 @@ def execute_remote_cmd(
 
             # Check if command is already running in this session
             if not force and check_command_running(client, session_name):
-                print(f"\n[!] Command already running in session '{session_name}'.")
-                print("[*] Options:")
-                print("    --new   : Run in a new session (safe concurrency)")
-                print("    --force : Override and kill existing command")
-                client.close()
-                return EXIT_BLOCKED, None
+                if auto:
+                    # Auto-create new session
+                    print(
+                        f"[*] Command already running in '{session_name}', "
+                        "auto-creating new session..."
+                    )
+                    new_session = True
+                    session_name = f"task_{uuid.uuid4().hex[:8]}"
+                else:
+                    print(f"\n[!] Command already running in session '{session_name}'.")
+                    print("[*] Options:")
+                    print("    --new   : Run in a new session (safe concurrency)")
+                    print("    --force : Override and kill existing command")
+                    print("    --auto  : Enable auto-create new session (default)")
+                    client.close()
+                    return EXIT_BLOCKED, None
 
         log_file = get_log_file(session_name)
         log_symlink = get_log_symlink(session_name)
@@ -588,12 +600,14 @@ def execute_remote_cmd(
             )
 
         stdin, stdout, stderr = client.exec_command(dispatch_cmd)
-        target_session = stdout.read().decode().strip()
+        # Read stdout to ensure command completes, but use session_name
+        # which we already know (more reliable than parsing command output)
+        stdout.read()
 
         if new_session:
-            print(f"[*] Created new session: {target_session}")
+            print(f"[*] Created new session: {session_name}")
         else:
-            print(f"[*] Using session: {target_session}")
+            print(f"[*] Using session: {session_name}")
 
         if timeout:
             print(f"[*] Timeout: {timeout}s, Idle timeout: {idle_timeout}s")
@@ -744,6 +758,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Clean up idle task_* sessions (keeps remote_task)",
     )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        dest="auto",
+        default=None,
+        help="Auto-create new session if command already running (default: true)",
+    )
+    parser.add_argument(
+        "--no-auto",
+        action="store_false",
+        dest="auto",
+        help="Disable auto-create, block if command already running",
+    )
     parser.add_argument("command", nargs="*", help="The command to execute remotely")
 
     args = parser.parse_args()
@@ -764,9 +791,15 @@ if __name__ == "__main__":
             print("[!] Username is required.")
             sys.exit(EXIT_ERROR)
 
+    # Resolve auto: CLI arg > saved config > default (True)
+    if args.auto is not None:
+        auto = args.auto
+    else:
+        auto = saved.get("auto_new_session", True)
+
     # Save for future use (preserve last_server until we connect)
     last_server = saved.get("last_server")
-    save_config(host, user, last_server)
+    save_config(host, user, last_server, auto)
 
     if args.clear:
         clear_credentials(host, user)
@@ -775,13 +808,13 @@ if __name__ == "__main__":
     if args.list:
         exit_code, current_server = list_running_sessions(host, user, last_server)
         if current_server:
-            save_config(host, user, current_server)
+            save_config(host, user, current_server, auto)
         sys.exit(exit_code)
 
     if args.cleanup:
         exit_code, current_server = cleanup_sessions(host, user, last_server)
         if current_server:
-            save_config(host, user, current_server)
+            save_config(host, user, current_server, auto)
         sys.exit(exit_code)
 
     if args.attach is not None:
@@ -789,7 +822,7 @@ if __name__ == "__main__":
         session = args.attach if args.attach else None
         exit_code, current_server = attach_to_session(host, user, session, last_server)
         if current_server:
-            save_config(host, user, current_server)
+            save_config(host, user, current_server, auto)
         sys.exit(exit_code)
 
     user_cmd = " ".join(args.command)
@@ -805,7 +838,8 @@ if __name__ == "__main__":
         new_session=args.new,
         force=args.force,
         last_server=last_server,
+        auto=auto,
     )
     if current_server:
-        save_config(host, user, current_server)
+        save_config(host, user, current_server, auto)
     sys.exit(exit_code)
