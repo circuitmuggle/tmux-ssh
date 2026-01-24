@@ -85,11 +85,15 @@ pip uninstall tmux-ssh
 ### Basic Commands
 
 ```bash
-# Run a command on remote server
-tmux-ssh "hostname"
+# First run: specify host and user
+tmux-ssh -H myserver.com -U myuser "hostname"
 
-# Run with custom host/user
-tmux-ssh -H myserver.com -U myuser "ls -la"
+# Subsequent runs: host/user are remembered automatically
+tmux-ssh "ls -la"
+tmux-ssh "pwd"
+
+# Override saved settings when needed
+tmux-ssh -H otherserver.com "hostname"
 
 # Set idle timeout (exit if no output for N seconds, default: 3600)
 tmux-ssh -i 7200 "long_running_command"
@@ -97,6 +101,17 @@ tmux-ssh -i 7200 "long_running_command"
 # Set total timeout
 tmux-ssh -t 3600 -i 1800 "very_long_command"
 ```
+
+### Saved Settings
+
+tmux-ssh automatically saves your connection settings to `~/.tmux_ssh_config`:
+
+- **Host** (`-H`): Remote hostname
+- **User** (`-U`): SSH username
+- **Last server**: Actual server hostname (for load-balancer detection)
+- **Auto-new setting**: Whether to auto-create sessions
+
+This means you only need to specify `-H` and `-U` once. All subsequent commands will use the saved settings automatically.
 
 ### Concurrent Execution
 
