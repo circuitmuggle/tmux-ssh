@@ -87,8 +87,14 @@ pip uninstall tmux-ssh
 ### Basic Commands
 
 ```bash
-# First run: specify host and user
+# SSH-compatible syntax (recommended)
+tmux-ssh user@host "command"
+tmux-ssh user@host:2222 "command"       # With custom port
+tmux-ssh host "command"                  # Uses saved username
+
+# Flag-based syntax (also supported)
 tmux-ssh -H myserver.com -U myuser "hostname"
+tmux-ssh -p 2222 -H myserver.com -U myuser "hostname"
 
 # Subsequent runs: host/user are remembered automatically
 tmux-ssh "ls -la"
@@ -104,16 +110,58 @@ tmux-ssh -i 7200 "long_running_command"
 tmux-ssh -t 3600 -i 1800 "very_long_command"
 ```
 
+### Command Quoting
+
+**When are quotes required?** Use quotes when your command contains:
+
+- **Shell operators**: `&&`, `||`, `;`, `|`, `>`, `<`, `>>`, `2>&1`
+- **Variable expansion**: `$VAR`, `$(command)`, backticks
+- **Wildcards**: `*`, `?`, `[...]`
+- **Spaces in arguments**: paths or strings with spaces
+
+```bash
+# REQUIRED: Commands with shell operators
+tmux-ssh user@host "cmd1 && cmd2"              # Chain commands
+tmux-ssh user@host "cmd1 || cmd2"              # OR operator
+tmux-ssh user@host "cmd1; cmd2"                # Sequential
+tmux-ssh user@host "cat file | grep pattern"   # Pipe
+tmux-ssh user@host "echo hello > output.txt"   # Redirect
+
+# REQUIRED: Commands with special characters
+tmux-ssh user@host 'echo $HOME'                # Preserve $HOME for remote
+tmux-ssh user@host "ls *.txt"                  # Wildcards
+tmux-ssh user@host "cd '/path with spaces'"    # Paths with spaces
+
+# OPTIONAL: Simple commands (quotes work but optional)
+tmux-ssh user@host hostname                    # Single word - OK
+tmux-ssh user@host "hostname"                  # Also OK
+tmux-ssh user@host ls -la /tmp                 # May fail (see note below)
+tmux-ssh user@host "ls -la /tmp"               # Safer with quotes
+```
+
+**Note on flags starting with `-`**: Arguments like `-la` may be interpreted as tmux-ssh flags. Always quote commands with such arguments:
+
+```bash
+# Problematic: -la might be parsed as a flag
+tmux-ssh user@host ls -la
+
+# Safe: Quote the entire command
+tmux-ssh user@host "ls -la"
+```
+
+**Best practice**: Always quote your command string to avoid surprises.
+
 ### Saved Settings
 
 tmux-ssh automatically saves your connection settings to `~/.tmux_ssh_config`:
 
 - **Host** (`-H`): Remote hostname
 - **User** (`-U`): SSH username
+- **Port** (`-p`): SSH port (default: 22)
 - **Last server**: Actual server hostname (for load-balancer detection)
 - **Auto-new setting**: Whether to auto-create sessions
 
-This means you only need to specify `-H` and `-U` once. All subsequent commands will use the saved settings automatically.
+This means you only need to specify connection details once. All subsequent commands will use the saved settings automatically.
 
 ### Concurrent Execution
 
@@ -250,10 +298,13 @@ log: ~/tmux_ssh_logs/remote_task_20260120_100000.log
 |--------|-------------|
 | `-H, --host` | Remote hostname |
 | `-U, --user` | Remote username |
+| `-p, --port` | SSH port (default: 22) |
 | `-t, --timeout` | Max seconds to stream (default: unlimited) |
 | `-i, --idle-timeout` | Exit if no output for N seconds (default: 3600) |
 | `-n, --new` | Create a new unique tmux session (inherits cwd, auto-terminates) |
 | `-f, --force` | Force execution, kill any running command |
+| `-k, --kill [SESSION]` | Kill running command (auto-detect if not specified) |
+| `-y, --yes` | Skip confirmation prompt (for --kill) |
 | `-a, --attach [SESSION]` | Attach to session (auto-detect if not specified) |
 | `-l, --list` | List all running commands/sessions |
 | `--cleanup` | Clean up idle task_* sessions (keeps remote_task) |
@@ -306,17 +357,27 @@ tmux-ssh --attach
 
 ### How do I actually terminate a running remote command?
 
-You have several options:
+Use the `--kill` option:
 
 ```bash
-# Option 1: Use --force to kill and run a new command
+# Kill command in auto-detected session
+tmux-ssh --kill
+
+# Kill command in a specific session
+tmux-ssh --kill task_a1b2c3d4
+```
+
+Alternative options:
+
+```bash
+# Use --force to kill and run a new command
 tmux-ssh --force "new_command"
 
-# Option 2: SSH directly and kill the process
+# SSH directly and kill the process
 ssh user@host
 pkill -f "your_command_pattern"
 
-# Option 3: SSH directly and attach to tmux, then Ctrl+C
+# SSH directly and attach to tmux, then Ctrl+C
 ssh user@host
 tmux attach -t remote_task
 # Now Ctrl+C will kill the command inside tmux

@@ -467,7 +467,7 @@ def attach_to_session(hostname, username, session_name=None, last_server=None):
             except Exception:
                 time.sleep(0.1)
 
-        print(f"\n{Fore.GREEN}[+] Command completed.{Style.RESET_ALL}")
+        print(f"\n{Fore.CYAN}[+] Command completed.{Style.RESET_ALL}")
         update_timestamp()
         client.close()
         return EXIT_COMPLETED, current_server
@@ -695,7 +695,7 @@ def execute_remote_cmd(
             except Exception:
                 time.sleep(0.1)
 
-        print(f"\n{Fore.GREEN}[+] Command completed.{Style.RESET_ALL}")
+        print(f"\n{Fore.CYAN}[+] Command completed.{Style.RESET_ALL}")
         update_timestamp()
         client.close()
         return EXIT_COMPLETED, current_server

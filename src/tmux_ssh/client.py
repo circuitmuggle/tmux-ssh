@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import os
 import sys
 import time
@@ -12,10 +13,41 @@ from datetime import datetime, timedelta
 
 import keyring
 import paramiko
-from colorama import Fore, Style, init
 
-# Initialize colorama for cross-platform colored output
-init(autoreset=True)
+# ANSI color codes
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+WHITE = "\033[37m"
+RESET = "\033[0m"
+
+
+# Color helpers for consistent output styling
+def info(msg: str) -> str:
+    """Format info message [*] in cyan."""
+    return f"{CYAN}[*]{RESET} {msg}"
+
+
+def success(msg: str) -> str:
+    """Format success message [+] in green."""
+    return f"{GREEN}[+]{RESET} {msg}"
+
+
+def warning(msg: str) -> str:
+    """Format warning message [!] in yellow."""
+    return f"{YELLOW}[!]{RESET} {msg}"
+
+
+def error(msg: str) -> str:
+    """Format error message [!] in red."""
+    return f"{RED}[!]{RESET} {msg}"
+
+
+def remote_output(line: str) -> str:
+    """Format remote server output in white/default for distinction."""
+    return f"{WHITE}{line}{RESET}"
+
 
 # Exit codes
 EXIT_COMPLETED = 0
@@ -30,6 +62,7 @@ class Config:
 
     hostname: str
     username: str
+    port: int = 22
     app_name: str = "TmuxSSHManager"
     timestamp_file: str = os.path.expanduser("~/.tmux_ssh_last_login")
     expiry_days: int = 30
@@ -89,9 +122,7 @@ class TmuxSSHClient:
                     self.config.hostname, self.config.username
                 )
             else:
-                import getpass
-
-                print("[*] Credentials missing or expired.")
+                print(info("Credentials missing or expired."))
                 prompt = (
                     f"[?] Enter passphrase/password for "
                     f"{self.config.username}@{self.config.hostname}: "
@@ -102,7 +133,7 @@ class TmuxSSHClient:
                 keyring.set_password(self.config.app_name, keyring_key, password)
                 self._update_timestamp()
 
-        return password  # type: ignore[return-value]
+        return password
 
     def _update_timestamp(self) -> None:
         """Mark login as successful."""
@@ -112,27 +143,74 @@ class TmuxSSHClient:
     def clear_credentials(self) -> None:
         """Wipe credentials from keyring."""
         keyring_key = f"{self.config.username}@{self.config.hostname}"
-        print(f"[*] Clearing stored credentials for {keyring_key}...")
+        print(info(f"Clearing stored credentials for {keyring_key}..."))
         try:
             keyring.delete_password(self.config.app_name, keyring_key)
-            print("[+] Keyring entry removed.")
+            print(success("Keyring entry removed."))
         except Exception as e:
-            print(f"[!] No keyring entry found or error occurred: {e}")
+            print(warning(f"No keyring entry found or error occurred: {e}"))
 
         if os.path.exists(self.config.timestamp_file):
             os.remove(self.config.timestamp_file)
-            print("[+] Local timestamp file removed.")
+            print(success("Local timestamp file removed."))
 
-    def _create_ssh_client(self, password: str) -> paramiko.SSHClient:
-        """Create and authenticate SSH client."""
+    def _try_agent_auth(self, transport: paramiko.Transport) -> bool:
+        """Try to authenticate using SSH agent.
+
+        Returns:
+            True if authentication succeeded, False otherwise.
+        """
+        try:
+            agent = paramiko.Agent()
+            agent_keys = agent.get_keys()
+
+            if not agent_keys:
+                return False
+
+            for key in agent_keys:
+                try:
+                    transport.auth_publickey(self.config.username, key)
+                    return True
+                except paramiko.AuthenticationException:
+                    continue
+
+            return False
+        except Exception:
+            return False
+
+    def _create_ssh_client(self, password: str | None = None) -> paramiko.SSHClient:
+        """Create and authenticate SSH client.
+
+        Tries authentication in this order:
+        1. SSH agent (keys loaded via ssh-add or macOS Keychain)
+        2. SSH key file with passphrase
+        3. Interactive authentication
+        4. Password authentication
+
+        Args:
+            password: Optional password/passphrase for fallback auth methods.
+                      If None and agent auth fails, will raise an exception.
+        """
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        transport = paramiko.Transport((self.config.hostname, 22))
+        transport = paramiko.Transport((self.config.hostname, self.config.port))
         transport.start_client()
 
+        # Try SSH agent first (no password needed)
+        if self._try_agent_auth(transport):
+            client._transport = transport  # type: ignore[attr-defined]
+            return client
+
+        # Agent auth failed, need password for remaining methods
+        if password is None:
+            transport.close()
+            raise paramiko.AuthenticationException(
+                "SSH agent authentication failed and no password provided"
+            )
+
         def interactive_handler(
-            title: str, instructions: str, prompt_list: list
+            title: str, instructions: str, prompt_list: list[tuple[str, bool]]
         ) -> list[str]:
             return [password]
 
@@ -155,29 +233,54 @@ class TmuxSSHClient:
                 transport.auth_password(self.config.username, password)
                 authenticated = True
 
-        client._transport = transport
+        client._transport = transport  # type: ignore[attr-defined]
         return client
 
     def _get_remote_hostname(self, client: paramiko.SSHClient) -> str:
         """Get the actual hostname of the remote server."""
-        stdin, stdout, stderr = client.exec_command("hostname")
+        _stdin, stdout, _stderr = client.exec_command("hostname")
         return stdout.read().decode().strip()
+
+    def _connect(self) -> paramiko.SSHClient:
+        """Connect to the remote server, trying SSH agent first.
+
+        Returns:
+            Connected SSH client.
+
+        This method:
+        1. First tries SSH agent authentication (no password prompt)
+        2. If agent fails, prompts for credentials and tries other methods
+        """
+        # First, try connecting with SSH agent only (no password)
+        try:
+            client = self._create_ssh_client(password=None)
+            return client
+        except paramiko.AuthenticationException:
+            pass  # Agent auth failed, fall back to password
+
+        # Agent failed, get credentials and try again
+        password = self.get_credentials()
+        return self._create_ssh_client(password=password)
 
     def _check_server_change(self, client: paramiko.SSHClient) -> None:
         """Check if connected to a different server than before and warn user."""
         self._current_server = self._get_remote_hostname(client)
 
         if self._last_server and self._current_server != self._last_server:
-            print("\n[!] WARNING: Server changed!")
+            print(f"\n{warning('WARNING: Server changed!')}")
             print(f"    Previous server: {self._last_server}")
             print(f"    Current server:  {self._current_server}")
             print(
-                f"[!] Your tmux sessions from '{self._last_server}' "
-                f"are NOT available on '{self._current_server}'."
+                warning(
+                    f"Your tmux sessions from '{self._last_server}' "
+                    f"are NOT available on '{self._current_server}'."
+                )
             )
             print(
-                f"[*] To access previous sessions, connect directly to: "
-                f"{self._last_server}"
+                info(
+                    f"To access previous sessions, connect directly to: "
+                    f"{self._last_server}"
+                )
             )
             print()
 
@@ -222,7 +325,7 @@ class TmuxSSHClient:
             f'  if [ -n "$DEF_S" ]; then echo "$DEF_S"; fi; '
             f"fi'"
         )
-        stdin, stdout, stderr = client.exec_command(check_cmd)
+        _stdin, stdout, _stderr = client.exec_command(check_cmd)
         return stdout.read().decode().strip()
 
     def _check_command_running(
@@ -231,7 +334,7 @@ class TmuxSSHClient:
         """Check if a command is currently running by checking lock file."""
         lock_file = self.get_lock_file(session_name, self.config.log_dir)
         check_cmd = f"sh -c '[ -f \"{lock_file}\" ] && echo running || echo idle'"
-        stdin, stdout, stderr = client.exec_command(check_cmd)
+        _stdin, stdout, _stderr = client.exec_command(check_cmd)
         result = stdout.read().decode().strip()
         return result == "running"
 
@@ -244,8 +347,11 @@ class TmuxSSHClient:
         Also returns list of all sessions with locks.
         """
         log_dir = self.config.log_dir
-        list_cmd = f"sh -c 'ls {log_dir}/*.lock 2>/dev/null'"
-        stdin, stdout, stderr = client.exec_command(list_cmd)
+        # Use find wrapped in sh -c to avoid tcsh glob/redirect issues
+        list_cmd = (
+            f"sh -c 'find {log_dir} -maxdepth 1 -name \"*.lock\" -type f 2>/dev/null'"
+        )
+        _stdin, stdout, _stderr = client.exec_command(list_cmd)
         output = stdout.read().decode().strip()
 
         if not output:
@@ -270,7 +376,7 @@ class TmuxSSHClient:
     ) -> str | None:
         """Get the current working directory of a tmux session."""
         cmd = f"tmux display-message -t \"{session_name}\" -p '#{{pane_current_path}}' 2>/dev/null"
-        stdin, stdout, stderr = client.exec_command(cmd)
+        _stdin, stdout, _stderr = client.exec_command(cmd)
         cwd = stdout.read().decode().strip()
         return cwd if cwd else None
 
@@ -282,23 +388,23 @@ class TmuxSSHClient:
         Returns:
             Exit code (EXIT_COMPLETED, EXIT_ERROR)
         """
-        password = self.get_credentials()
-
         try:
             print(
-                f"[*] Connecting to {self.config.hostname} "
-                f"as {self.config.username}..."
+                info(
+                    f"Connecting to {self.config.hostname} "
+                    f"as {self.config.username}..."
+                )
             )
-            client = self._create_ssh_client(password)
+            client = self._connect()
             self._check_server_change(client)
 
             # Get list of all tmux sessions
             list_cmd = "tmux ls -F '#{session_name}' 2>/dev/null"
-            stdin, stdout, stderr = client.exec_command(list_cmd)
+            _stdin, stdout, _stderr = client.exec_command(list_cmd)
             output = stdout.read().decode().strip()
 
             if not output:
-                print("[*] No tmux sessions found.")
+                print(info("No tmux sessions found."))
                 client.close()
                 return EXIT_COMPLETED
 
@@ -319,7 +425,7 @@ class TmuxSSHClient:
                     check_cmd = (
                         f"sh -c '[ -f \"{lock_file}\" ] && echo running || echo idle'"
                     )
-                    stdin, stdout, stderr = client.exec_command(check_cmd)
+                    _stdin, stdout, _stderr = client.exec_command(check_cmd)
                     status = stdout.read().decode().strip()
 
                     if status == "idle":
@@ -332,19 +438,23 @@ class TmuxSSHClient:
                     kept.append(session)
 
             if killed:
-                print(f"[+] Killed {len(killed)} idle session(s): {', '.join(killed)}")
+                print(
+                    success(
+                        f"Killed {len(killed)} idle session(s): {', '.join(killed)}"
+                    )
+                )
             else:
-                print("[*] No idle task_* sessions to clean up.")
+                print(info("No idle task_* sessions to clean up."))
 
             if kept:
-                print(f"[*] Kept session(s): {', '.join(kept)}")
+                print(info(f"Kept session(s): {', '.join(kept)}"))
 
             self._update_timestamp()
             client.close()
             return EXIT_COMPLETED
 
         except Exception as e:
-            print(f"[!] Connection error: {e}")
+            print(error(f"Connection error: {e}"))
             return EXIT_ERROR
 
     def list_running(self) -> int:
@@ -354,28 +464,29 @@ class TmuxSSHClient:
         Returns:
             Exit code (EXIT_COMPLETED, EXIT_ERROR)
         """
-        password = self.get_credentials()
-
         try:
             print(
-                f"[*] Connecting to {self.config.hostname} "
-                f"as {self.config.username}..."
+                info(
+                    f"Connecting to {self.config.hostname} "
+                    f"as {self.config.username}..."
+                )
             )
-            client = self._create_ssh_client(password)
+            client = self._connect()
             self._check_server_change(client)
 
             log_dir = self.config.log_dir
+            # Use find + while loop to avoid tcsh glob/redirect issues
             list_cmd = (
-                f"sh -c 'for f in {log_dir}/*.lock 2>/dev/null; do "
-                f'if [ -f "$f" ]; then echo "=== $f ==="; cat "$f"; echo ""; fi; done\''
+                f'sh -c \'find {log_dir} -maxdepth 1 -name "*.lock" -type f 2>/dev/null | '
+                'while read f; do echo "=== $f ==="; cat "$f"; echo ""; done\''
             )
-            stdin, stdout, stderr = client.exec_command(list_cmd)
+            _stdin, stdout, _stderr = client.exec_command(list_cmd)
             output = stdout.read().decode().strip()
 
             if not output:
-                print("[*] No running commands found.")
+                print(info("No running commands found."))
             else:
-                print("[*] Running commands:\n")
+                print(info("Running commands:\n"))
                 print(output)
 
             self._update_timestamp()
@@ -383,7 +494,7 @@ class TmuxSSHClient:
             return EXIT_COMPLETED
 
         except Exception as e:
-            print(f"[!] Connection error: {e}")
+            print(error(f"Connection error: {e}"))
             return EXIT_ERROR
 
     def attach(self, session_name: str | None = None) -> int:
@@ -395,14 +506,14 @@ class TmuxSSHClient:
         Returns:
             Exit code (EXIT_COMPLETED, EXIT_ERROR, EXIT_STILL_RUNNING)
         """
-        password = self.get_credentials()
-
         try:
             print(
-                f"[*] Connecting to {self.config.hostname} "
-                f"as {self.config.username}..."
+                info(
+                    f"Connecting to {self.config.hostname} "
+                    f"as {self.config.username}..."
+                )
             )
-            client = self._create_ssh_client(password)
+            client = self._connect()
             self._check_server_change(client)
 
             # If no session specified, try to auto-detect from lock files
@@ -412,31 +523,92 @@ class TmuxSSHClient:
                 )
 
                 if not all_sessions:
-                    print("[!] No running commands found (no lock files).")
+                    print(warning("No running commands found (no lock files)."))
                     client.close()
                     return EXIT_ERROR
 
                 if len(all_sessions) == 1:
                     session_name = auto_session
-                    print(f"[*] Auto-detected session: {session_name}")
+                    assert session_name is not None  # Guaranteed when len == 1
+                    print(info(f"Auto-detected session: {session_name}"))
                 else:
                     print(
-                        f"[!] Multiple running sessions found: {', '.join(all_sessions)}"
+                        warning(
+                            f"Multiple running sessions found: {', '.join(all_sessions)}"
+                        )
                     )
                     print(
-                        "[*] Please specify a session with: tmux-ssh --attach <session_name>"
+                        info(
+                            "Please specify a session with: tmux-ssh --attach <session_name>"
+                        )
                     )
-                    print("[*] Or use 'tmux-ssh --list' to see details.")
+                    print(info("Or use 'tmux-ssh --list' to see details."))
                     client.close()
                     return EXIT_ERROR
 
-            print(f"[*] Attaching to session: {session_name}")
+            print(info(f"Attaching to session: {session_name}"))
+
+            # Verify tmux session actually exists on this server
+            # (lock file may be visible via shared NFS but session is elsewhere)
+            check_session_cmd = f'tmux has-session -t "{session_name}" 2>/dev/null && echo exists || echo missing'
+            _stdin, stdout, _stderr = client.exec_command(check_session_cmd)
+            session_status = stdout.read().decode().strip()
+
+            if session_status != "exists":
+                # Get lock file info to find actual server
+                lock_file = self.get_lock_file(session_name, self.config.log_dir)
+                get_lock_cmd = f'sh -c \'grep "^server:" "{lock_file}" 2>/dev/null\''
+                _stdin, stdout, _stderr = client.exec_command(get_lock_cmd)
+                server_line = stdout.read().decode().strip()
+                lock_server = (
+                    server_line.split(":", 1)[1].strip() if server_line else None
+                )
+
+                print(error(f"Tmux session '{session_name}' not found on this server!"))
+                print(f"    Currently connected to: {self._current_server}")
+
+                if lock_server and lock_server != self._current_server:
+                    # Session is on a different server
+                    print(f"    Session was created on: {lock_server}")
+                    print(
+                        info(
+                            f"To attach, connect directly: "
+                            f"tmux-ssh -H {lock_server} --attach {session_name}"
+                        )
+                    )
+                elif lock_server and lock_server == self._current_server:
+                    # Lock file says session is here but tmux says it doesn't exist
+                    # This is a stale lock file
+                    print(
+                        warning(
+                            "Lock file is stale - session was on this server but no longer exists."
+                        )
+                    )
+                    print(info(f"Removing stale lock file: {lock_file}"))
+                    client.exec_command(f'rm -f "{lock_file}"')
+                else:
+                    print(
+                        warning(
+                            "Lock file exists (possibly via shared NFS) but session is on another server."
+                        )
+                    )
+                    print(
+                        info(
+                            "Check 'tmux-ssh --list' on each server to find where the session is running."
+                        )
+                    )
+                client.close()
+                return EXIT_ERROR
 
             # Check if command is running
             if not self._check_command_running(client, session_name):
-                print(f"[!] No command currently running in session '{session_name}'.")
+                print(
+                    warning(
+                        f"No command currently running in session '{session_name}'."
+                    )
+                )
                 log_symlink = self.get_log_symlink(session_name, self.config.log_dir)
-                print(f"[*] You can view the latest log at: {log_symlink}")
+                print(info(f"You can view the latest log at: {log_symlink}"))
                 client.close()
                 return EXIT_COMPLETED
 
@@ -445,17 +617,17 @@ class TmuxSSHClient:
             get_log_cmd = (
                 f'sh -c \'if [ -f "{lock_file}" ]; then cat "{lock_file}"; fi\''
             )
-            stdin, stdout, stderr = client.exec_command(get_log_cmd)
+            _stdin, stdout, _stderr = client.exec_command(get_log_cmd)
             lock_info = stdout.read().decode().strip()
-            print(f"[*] Lock file info:\n{lock_info}\n")
+            print(info(f"Lock file info:\n{lock_info}\n"))
 
             # Stream from the latest symlink
             log_symlink = self.get_log_symlink(session_name, self.config.log_dir)
-            print(f"[*] Streaming from: {log_symlink}")
-            print(f"{Fore.CYAN}[*] Streaming output:{Style.RESET_ALL}\n")
+            print(info(f"Streaming from: {log_symlink}"))
+            print(f"{CYAN}[*] Streaming output:{RESET}\n")
 
             tail_cmd = f'tail -n +1 -f "{log_symlink}"'
-            stdin, stdout, stderr = client.exec_command(tail_cmd)
+            _stdin, stdout, _stderr = client.exec_command(tail_cmd)
 
             channel = stdout.channel
             channel.setblocking(0)
@@ -487,7 +659,7 @@ class TmuxSSHClient:
                                     break
 
                                 if started:
-                                    print(line)
+                                    print(remote_output(line))
                                     sys.stdout.flush()
                     else:
                         time.sleep(0.1)
@@ -496,7 +668,7 @@ class TmuxSSHClient:
                     idle_time = time.time() - last_output_time
                     if idle_time > 30:  # Check every 30 seconds of idle
                         if not self._check_command_running(client, session_name):
-                            print("\n[*] Command appears to have completed.")
+                            print(f"\n{info('Command appears to have completed.')}")
                             command_completed = True
                             break
                         last_output_time = time.time()  # Reset to avoid repeated checks
@@ -504,13 +676,193 @@ class TmuxSSHClient:
                 except Exception:
                     time.sleep(0.1)
 
-            print(f"\n{Fore.GREEN}[+] Command completed.{Style.RESET_ALL}")
+            print(f"\n{success('Command completed.')}")
             self._update_timestamp()
             client.close()
             return EXIT_COMPLETED
 
         except Exception as e:
-            print(f"[!] Connection error: {e}")
+            print(error(f"Connection error: {e}"))
+            return EXIT_ERROR
+
+    def kill(self, session_name: str | None = None, force: bool = False) -> int:
+        """Kill the running command in a tmux session.
+
+        Args:
+            session_name: Session to kill command in (default: auto-detect from lock files)
+            force: Skip confirmation prompt
+
+        Returns:
+            Exit code (EXIT_COMPLETED, EXIT_ERROR)
+        """
+        try:
+            print(
+                info(
+                    f"Connecting to {self.config.hostname} "
+                    f"as {self.config.username}..."
+                )
+            )
+            client = self._connect()
+            self._check_server_change(client)
+
+            current_server = self._current_server
+
+            # If no session specified, try to auto-detect from lock files
+            if not session_name:
+                auto_session, all_sessions = self._find_running_session_from_locks(
+                    client
+                )
+
+                if not all_sessions:
+                    print(warning("No running commands found (no lock files)."))
+                    client.close()
+                    return EXIT_ERROR
+
+                if len(all_sessions) == 1:
+                    session_name = auto_session
+                    assert session_name is not None  # Guaranteed when len == 1
+                    print(info(f"Auto-detected session: {session_name}"))
+                else:
+                    print(
+                        warning(
+                            f"Multiple running sessions found: {', '.join(all_sessions)}"
+                        )
+                    )
+                    print(
+                        info(
+                            "Please specify a session with: tmux-ssh --kill <session_name>"
+                        )
+                    )
+                    print(info("Or use 'tmux-ssh --list' to see details."))
+                    client.close()
+                    return EXIT_ERROR
+
+            # Check if command is running
+            if not self._check_command_running(client, session_name):
+                print(
+                    warning(
+                        f"No command currently running in session '{session_name}'."
+                    )
+                )
+                client.close()
+                return EXIT_COMPLETED
+
+            # Get lock file info before killing
+            lock_file = self.get_lock_file(session_name, self.config.log_dir)
+            get_lock_cmd = (
+                f'sh -c \'if [ -f "{lock_file}" ]; then cat "{lock_file}"; fi\''
+            )
+            _stdin, stdout, _stderr = client.exec_command(get_lock_cmd)
+            lock_info = stdout.read().decode().strip()
+
+            # Parse lock file info
+            lock_server = None
+            lock_cmd = None
+            if lock_info:
+                for line in lock_info.split("\n"):
+                    if line.startswith("server:"):
+                        lock_server = line.split(":", 1)[1].strip()
+                    elif line.startswith("cmd:"):
+                        lock_cmd = line.split(":", 1)[1].strip()
+
+            # Verify server matches
+            if lock_server and lock_server != current_server:
+                print(error("Server mismatch!"))
+                print(f"    Lock file says session is on: {lock_server}")
+                print(f"    Currently connected to:       {current_server}")
+                print(warning("This session was created on a different server."))
+                print(
+                    info(
+                        f"To kill it, connect directly: "
+                        f"tmux-ssh -H {lock_server} --kill {session_name}"
+                    )
+                )
+                client.close()
+                return EXIT_ERROR
+
+            # Verify tmux session actually exists on this server
+            # (lock file may be visible via shared NFS but session is elsewhere)
+            check_session_cmd = f'tmux has-session -t "{session_name}" 2>/dev/null && echo exists || echo missing'
+            _stdin, stdout, _stderr = client.exec_command(check_session_cmd)
+            session_status = stdout.read().decode().strip()
+
+            if session_status != "exists":
+                print(error(f"Tmux session '{session_name}' not found on this server!"))
+                print(f"    Currently connected to: {current_server}")
+
+                if lock_server and lock_server != current_server:
+                    # Session is on a different server
+                    print(f"    Session was created on: {lock_server}")
+                    print(
+                        info(
+                            f"To kill it, connect directly: "
+                            f"tmux-ssh -H {lock_server} --kill {session_name}"
+                        )
+                    )
+                elif lock_server and lock_server == current_server:
+                    # Lock file says session is here but tmux says it doesn't exist
+                    # This is a stale lock file
+                    print(
+                        warning(
+                            "Lock file is stale - session was on this server but no longer exists."
+                        )
+                    )
+                    print(info(f"Removing stale lock file: {lock_file}"))
+                    client.exec_command(f'rm -f "{lock_file}"')
+                else:
+                    print(
+                        warning(
+                            "Lock file exists (possibly via shared NFS) but session is on another server."
+                        )
+                    )
+                    print(
+                        info(
+                            "Check 'tmux-ssh --list' on each server to find where the session is running."
+                        )
+                    )
+                client.close()
+                return EXIT_ERROR
+
+            # Show what we're about to kill
+            print(info(f"About to kill command in session '{session_name}':"))
+            print(f"    Server:  {current_server}")
+            if lock_cmd:
+                print(
+                    f"    Command: {lock_cmd[:80]}{'...' if len(lock_cmd) > 80 else ''}"
+                )
+
+            # Confirmation prompt (unless force)
+            if not force:
+                try:
+                    response = input("\n[?] Kill this command? [y/N]: ").strip().lower()
+                    if response not in {"y", "yes"}:
+                        print(info("Cancelled."))
+                        client.close()
+                        return EXIT_COMPLETED
+                except (EOFError, KeyboardInterrupt):
+                    print("\n" + info("Cancelled."))
+                    client.close()
+                    return EXIT_COMPLETED
+
+            # Send Ctrl+C to the tmux session
+            kill_cmd = f'tmux send-keys -t "{session_name}" C-c'
+            client.exec_command(kill_cmd)
+
+            # Wait a moment for the signal to be processed
+            time.sleep(0.5)
+
+            # Remove the lock file
+            rm_lock_cmd = f'rm -f "{lock_file}"'
+            client.exec_command(rm_lock_cmd)
+
+            print(success(f"Killed command in session '{session_name}'."))
+
+            self._update_timestamp()
+            client.close()
+            return EXIT_COMPLETED
+
+        except Exception as e:
+            print(error(f"Connection error: {e}"))
             return EXIT_ERROR
 
     def execute(
@@ -535,14 +887,14 @@ class TmuxSSHClient:
         Returns:
             Exit code (EXIT_COMPLETED, EXIT_ERROR, EXIT_STILL_RUNNING, EXIT_BLOCKED)
         """
-        password = self.get_credentials()
-
         try:
             print(
-                f"[*] Connecting to {self.config.hostname} "
-                f"as {self.config.username}..."
+                info(
+                    f"Connecting to {self.config.hostname} "
+                    f"as {self.config.username}..."
+                )
             )
-            client = self._create_ssh_client(password)
+            client = self._connect()
             self._check_server_change(client)
 
             # Determine session name
@@ -560,14 +912,15 @@ class TmuxSSHClient:
                         new_session = True
                         session_name = f"task_{uuid.uuid4().hex[:8]}"
                         print(
-                            f"[*] Session '{old_session}' is busy, "
-                            f"creating '{session_name}' for concurrent execution..."
+                            info(
+                                f"Session '{old_session}' is busy, "
+                                f"creating '{session_name}' for concurrent execution..."
+                            )
                         )
                     else:
-                        print(
-                            f"\n[!] Command already running in session '{session_name}'."
-                        )
-                        print("[*] Options:")
+                        msg = f"Command already running in session '{session_name}'."
+                        print(f"\n{warning(msg)}")
+                        print(info("Options:"))
                         print("    --new   : Run in a new session (safe concurrency)")
                         print("    --force : Override and kill existing command")
                         print("    --auto  : Enable auto-create new session (default)")
@@ -601,6 +954,7 @@ class TmuxSSHClient:
                     f'ln -sf "{log_file}" "{log_symlink}"; '
                     f'echo "cmd: {safe_cmd}" > "{lock_file}"; '
                     f'echo "started: $(date)" >> "{lock_file}"; '
+                    f'echo "server: $(hostname)" >> "{lock_file}"; '
                     f'echo "session: {session_name}" >> "{lock_file}"; '
                     f'echo "log: {log_file}" >> "{lock_file}"; '
                     f'tmux new-session -d -s "{session_name}" '
@@ -612,8 +966,10 @@ class TmuxSSHClient:
                 )
                 if default_cwd:
                     print(
-                        f"[*] Inheriting directory from {self.config.default_session}: "
-                        f"{default_cwd}"
+                        info(
+                            f"Inheriting directory from {self.config.default_session}: "
+                            f"{default_cwd}"
+                        )
                     )
             else:
                 # Use existing session - keep alive with exec /bin/bash for default session
@@ -630,6 +986,7 @@ class TmuxSSHClient:
                     f'ln -sf "{log_file}" "{log_symlink}"; '
                     f'echo "cmd: {safe_cmd}" > "{lock_file}"; '
                     f'echo "started: $(date)" >> "{lock_file}"; '
+                    f'echo "server: $(hostname)" >> "{lock_file}"; '
                     f'echo "session: {session_name}" >> "{lock_file}"; '
                     f'echo "log: {log_file}" >> "{lock_file}"; '
                     f'if tmux has-session -t "{session_name}" 2>/dev/null; then '
@@ -649,29 +1006,29 @@ class TmuxSSHClient:
                     f'echo "{session_name}"\''
                 )
 
-            stdin, stdout, stderr = client.exec_command(dispatch_cmd)
+            _stdin, stdout, _stderr = client.exec_command(dispatch_cmd)
             # Read stdout to ensure command completes, but use session_name
             # which we already know (more reliable than parsing command output)
             stdout.read()
 
             if new_session:
-                print(f"[*] Created new session: {session_name}")
+                print(info(f"Created new session: {session_name}"))
             else:
-                print(f"[*] Using session: {session_name}")
+                print(info(f"Using session: {session_name}"))
 
             if timeout:
-                print(f"[*] Timeout: {timeout}s, Idle timeout: {idle_timeout}s")
+                print(info(f"Timeout: {timeout}s, Idle timeout: {idle_timeout}s"))
             else:
-                print(f"[*] Idle timeout: {idle_timeout}s")
+                print(info(f"Idle timeout: {idle_timeout}s"))
 
-            print(f"{Fore.CYAN}[*] Dispatching:{Style.RESET_ALL} {command}")
-            print(f"[*] Log file: {log_file}")
+            print(f"{CYAN}[*] Dispatching:{RESET} {command}")
+            print(info(f"Log file: {log_file}"))
             time.sleep(0.5)
-            print(f"{Fore.CYAN}[*] Streaming output:{Style.RESET_ALL}\n")
+            print(f"{CYAN}[*] Streaming output:{RESET}\n")
 
             # Stream output using tail -f on the symlink
             tail_cmd = f'tail -n +1 -f "{log_symlink}"'
-            stdin, stdout, stderr = client.exec_command(tail_cmd)
+            _stdin, stdout, _stderr = client.exec_command(tail_cmd)
 
             channel = stdout.channel
             channel.setblocking(0)
@@ -702,7 +1059,7 @@ class TmuxSSHClient:
                                     break
 
                                 if started:
-                                    print(line)
+                                    print(remote_output(line))
                                     sys.stdout.flush()
                     else:
                         time.sleep(0.1)
@@ -712,26 +1069,28 @@ class TmuxSSHClient:
 
                     if timeout and elapsed > timeout:
                         print(
-                            f"\n[*] Timeout ({timeout}s) reached. "
-                            "Command still running in tmux."
+                            f"\n{info(f'Timeout ({timeout}s) reached. Command still running in tmux.')}"
                         )
                         print(
-                            "[*] Use 'tmux-ssh --attach' to resume streaming the output."
+                            info(
+                                "Use 'tmux-ssh --attach' to resume streaming the output."
+                            )
                         )
-                        print(f"[*] Log file: {log_file}")
+                        print(info(f"Log file: {log_file}"))
                         self._update_timestamp()
                         client.close()
                         return EXIT_STILL_RUNNING
 
                     if idle_time > idle_timeout:
                         print(
-                            f"\n[*] Idle timeout ({idle_timeout}s) reached. "
-                            "Command still running in tmux."
+                            f"\n{info(f'Idle timeout ({idle_timeout}s) reached. Command still running in tmux.')}"
                         )
                         print(
-                            "[*] Use 'tmux-ssh --attach' to resume streaming the output."
+                            info(
+                                "Use 'tmux-ssh --attach' to resume streaming the output."
+                            )
                         )
-                        print(f"[*] Log file: {log_file}")
+                        print(info(f"Log file: {log_file}"))
                         self._update_timestamp()
                         client.close()
                         return EXIT_STILL_RUNNING
@@ -739,11 +1098,11 @@ class TmuxSSHClient:
                 except Exception:
                     time.sleep(0.1)
 
-            print(f"\n{Fore.GREEN}[+] Command completed.{Style.RESET_ALL}")
+            print(f"\n{success('Command completed.')}")
             self._update_timestamp()
             client.close()
             return EXIT_COMPLETED
 
         except Exception as e:
-            print(f"[!] Connection error: {e}")
+            print(error(f"Connection error: {e}"))
             return EXIT_ERROR
