@@ -16,7 +16,7 @@ from tmux_ssh.client import (
 )
 
 # Config file for persisting host/user
-CONFIG_FILE = os.path.expanduser("~/.tmux_ssh_config")
+CONFIG_FILE = os.path.expanduser("~/.tmux4ssh_config")
 
 
 def load_saved_config() -> dict[str, str | bool | int]:
